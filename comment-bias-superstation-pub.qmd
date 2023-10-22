@@ -1,0 +1,460 @@
+---
+title: "Comment on El Rafei et. al. (2023). Biases in Estimating Long-Term Recurrence Intervals of Extreme Events Due To Regionalized Sampling"
+
+author:
+  - id: chw
+    name: Chi-Hsiang Wang and John D. Holmes
+    email: chi-hsiang.wang@csiro.au
+  
+affiliation:
+  - id: chw
+    name: CSIRO Energy
+    city: Melbourne
+    country: Australia
+
+date: 20 October 2023
+data-format: D MMMM YYYY
+
+format: 
+  html:
+    toc: false
+    embed-resources: true
+---
+
+```{r}
+#| label: start
+#| context: setup
+#| include: false
+knitr::opts_chunk$set(echo=FALSE, cache=TRUE,
+  fig.asp=0.618, fig.width=5, out.width="100%", fig.align='center')
+
+xfun::pkg_attach("rprojroot", "evd", "tidyverse")
+
+theme_set(theme_bw())
+
+proj_root <- find_rstudio_root_file
+```
+
+
+```{r}
+#| label: functions
+
+get_df_sites <- function(sites, rate, years, loc, scl, shp) {
+  # Data frame for the sites
+  df_sites <- map_dfr(1:sites, \(i) tibble(
+    ws = sort(rgpd(n = rate * years, loc = loc, scale = scl, shape = shp)),
+  ) |> 
+    get_ari(n_events = rate * years, n_years = years) |> 
+    mutate(site = as.character(i), .before = ws)
+  ) |> 
+    arrange(ws)
+  
+  # Add ARI's for super-station
+  df_sites |> 
+    select(site, ws) %>%
+    get_ari(n_events = nrow(.), n_years = years * sites) |> 
+    rename(ari_super = ari) |> 
+    bind_cols(
+      df_sites |> 
+        select(ari)
+    )
+}
+
+get_ari <- function(df, n_events, n_years) {
+  df |> 
+    mutate(ari = map_dbl(1:nrow(df), ~ (n_years) / (n_events - .x + 1)))
+}
+
+get_log_breaks <- function(exponents, base) {
+  unlist(map(exponents, ~ base^.x * 1:10)) |> unique()
+}
+
+# Get the GPD parameters for wind speed formula in AS/NZS 1170.2:2021
+get_params_AS <- function(C, D, thres = 20) {
+  p_scale <- (C - thres) * 0.1
+  p_rate <- (10 * p_scale / D)^10
+  c(rate = p_rate, scale = p_scale)
+}
+
+# Obtain the fitted scale parameters of GPD model
+get_scales_fitted <- function(events, sample_size, scl_true) {
+  map_dbl(1:sample_size, \(i) 
+    fpot(rgpd(n = events, loc = v0, scale = scl_true, shape = k), threshold = v0, shape = k)$param[1]
+  )
+}
+
+# Compute GPD model wind speeds up to years
+get_model_ws <- function(years, rate, thres, scl, shp) {
+  tibble(
+    ari = c(get_log_breaks(-1:2, 10), years + 1)
+  ) |> 
+    filter(ari <= years + 1 & ari > 0.1) |> 
+    mutate(ws = vgpd(ari, rate, thres, scl, shp))
+}
+
+vgpd <- function(ari, rate, loc, scale, shape) {
+  # The signs follow the formula by evd::pgpd(); k < 0 is Type III
+  loc - scale * (1 - (rate * ari)^shape) / shape
+}
+
+add_axis_x <- function(xmax) {
+  scale_x_log10(
+    name = "ARI (years)",
+    limits = c(0.2, xmax),
+    breaks = scales::breaks_log(n = 6),
+    minor_breaks = get_log_breaks(exponents = -1:5, base = 10),
+    labels = scales::label_number(scale_cut = scales::cut_short_scale()),
+    expand = expansion()
+  )
+}
+
+add_axis_y <- function(ymax = NA) {
+  if (is.na(ymax))
+    y_expand = 0.05
+  else
+    y_expand = 0
+  
+  scale_y_continuous(
+    name = bquote("Wind gust speed"~(m/s)), limits = c(20, ymax), expand = expansion(mult = c(0, y_expand))
+  )
+}
+```
+
+```{r}
+#| label: constants
+
+rate_exc <- 5                           # Annual rate of exceedance
+v0 <- 20                                # Location parameter
+s <- seq(3, 4, by = 0.25)               # Scale parameters, 5 models are considered
+s_chr <- paste("\U03c3", "=", s)
+k <- -0.1                               # shape parameter (negative is for Type III, as in 'evd' package)
+
+n_sites <- 25                           # No. of sites for 5x5 grid points
+n_years <- 23                           # same length as the authors used for BARRA-SY data
+n_events <- rate_exc * n_years          # No. of events for a 23-year period
+
+n_years_sim <- 1e3                      # Years for Figure 2
+n_events_sim <- rate_exc * n_years_sim  # No. of events for a 1000-year period
+
+n_years_demo <- 5e4  # For demonstrating the homogenisation step
+n_sites_demo <- 1
+
+
+set.seed(2023081901)
+
+# Generate 23-year wind gusts for all models at all sites
+#   (25 sites * 23 years * 5 exceedances * 5 models = 2875 * 5 rows)
+df_sites <- map2_dfr(s, s_chr,
+  \(scale, scale_chr) get_df_sites(n_sites, rate_exc, n_years, v0, scale, k) |> mutate(p_scale = scale_chr))
+
+# Generate 1,000 wind gusts for all models at all sites
+df_sites_1k <- map2_dfr(s, s_chr,
+  \(scale, scale_chr) get_df_sites(n_sites, rate_exc, n_years_sim, v0, scale, k) |> mutate(p_scale = scale_chr))
+
+# Fit the model by stacking the simulated data from all 5 models
+model_super_wrong <- map_dfr(s, \(scl) tibble(
+  ws = rgpd(rate_exc * n_years_sim, loc = v0, scale = scl, shape = k)
+)) |> 
+  pull(ws) |> 
+  fpot(threshold = v0)
+
+# Compute exact data points for plotting for all 5 models
+df_ws_exact <- map2_dfr(s_chr, s, \(sc, s) 
+  tibble(
+    ari = get_log_breaks(-1:4, 10)
+  ) |> 
+    mutate(ws = vgpd(ari, rate_exc, v0, s, k)) |> 
+    mutate(p_scale = sc, .before = ari)
+)
+```
+
+```{r}
+#| label: variables
+
+# Fit GPD models for super-stations
+model_super <- fpot(df_sites$ws, threshold = v0)  # super-station model  for data combining every site of every model
+models <- map(                                    # super-station models for data combining every site of a model
+  unique(df_sites$p_scale),
+  \(s) fpot(
+    df_sites |> 
+      filter(p_scale == s) |> 
+      pull(ws), 
+    threshold = v0)
+  )
+
+# Compute the scale-parameter CI's of 23 & 1,000 years for model 3 ------------
+n_sim <- 1e4  # use 1e4 for final output
+n_sim_super <- 1e3  # use 1e3 for final output
+s3_sim_23yrs <- get_scales_fitted(rate_exc * n_years, n_sim, s[3])
+s3_sim_super_23yrs <- get_scales_fitted(rate_exc * n_years * n_sites, length(s3_sim_23yrs), s[3])
+s3_sim_1kyrs <- get_scales_fitted(rate_exc * n_years_sim, length(s3_sim_23yrs), s[3])
+s3_sim_super_1kyrs <- get_scales_fitted(rate_exc * n_years_sim * n_sites, n_sim_super, s[3])
+
+s3_sim <- tibble(
+  s = c(s3_sim_23yrs, s3_sim_super_23yrs, s3_sim_1kyrs, s3_sim_super_1kyrs),
+  yrs = c(rep(c("23 years", "23 years", "1000 years"),each = length(s3_sim_1kyrs)),
+          rep("1000 years", n_sim_super)) |> as.factor(),
+  stn_type = c(rep(c("one site", "25 sites grouped", "one site"), each = length(s3_sim_1kyrs)),
+               rep("25 sites grouped", times = n_sim_super)) |> as.factor()
+)
+
+s3_sim_ci <- s3_sim |> 
+  reframe(q = round(quantile(s, probs = c(0.025, 0.975)), 2), .by = c(yrs, stn_type)) |> 
+  add_column(pct = rep(c("2.5%", "97.5%"), 4)) |> 
+  pivot_wider(names_from = pct, values_from = q)
+# -------------------------------------------------------------------------------
+
+  
+# Fitted GPD model parameters for all sites & all models assuming fixed shape parameter
+df_sites_models_pars <- df_sites |> 
+  select(!c(ari_super)) |> 
+  nest_by(p_scale, site) |> 
+  # model fitting by fixing the shape param for individual site
+  mutate(model = list(fpot(data$ws, threshold = 20, shape = k))) |> 
+  mutate(
+    thres = list(model$threshold),
+    scl = list(model$param[1]),
+    shp = list(model$param[2])
+  )|> 
+  ungroup() |> 
+  select(!data:model) |> 
+  unnest(cols = where(is.list))
+
+# Model-predicted wind speeds for all sites and all models
+df_sites_ws_pred <- df_sites_models_pars |> 
+  nest_by(p_scale, site) |> 
+  mutate(ws_model = list(
+    pmap_dfr(data, \(thres, scl, shp) get_model_ws(n_sites * n_years, rate_exc, thres, scl, shp)))) |> 
+  unnest(cols = c("data", "ws_model")) |> 
+  ungroup()
+
+# Super-station model-predicted wind gusts for all models
+df_super_ws_pred <- tibble(
+  p_scale = s_chr,
+  site = "super",
+  thres = map_dbl(models, \(x) x$threshold),
+  scl = map_dbl(models, \(x) x$param[1]),
+  shp = map_dbl(models, \(x) x$param[2])
+) |> 
+  rowwise(p_scale, site) |> 
+  mutate(ws_model = list(get_model_ws(n_sites * n_years, rate_exc, thres, scl, shp))) |> 
+  unnest(cols = "ws_model") |> 
+  ungroup()
+
+
+# Compute ARI's by stacking data from all sites and all 5 models --------------
+#   This is a wrong way to apply the super-station as the data are
+#     from 5 different sample spaces
+df_super_wrong <- df_sites |> 
+  select(!ari) |> 
+  arrange(ws) |> 
+  mutate(ari_super_wrong = (n_years * n_sites * length(s) + 1) / (n() - 1:n() + 1))
+```
+
+```{r}
+#| label: fig-haz-sites-model-3-sim
+#| fig-cap: Simuated gust data of 25 hypothetical stations (thin black lines) for 23 and 1,000 years and respective super-stations (red dots)
+#| warning: false
+#| cache: false
+bind_rows(
+  df_sites |> filter(str_ends(p_scale, "3.5")) |> mutate(years = "23 years", .before = site),
+  df_sites_1k |> filter(str_ends(p_scale, "3.5")) |> mutate(years = "1000 years", .before = site)
+) |> 
+  mutate(years = fct_rev(as.factor(years))) |> 
+  # mutate(fig_part = if_else(str_starts(years, "23"), "a", "b"))
+  ggplot(aes(x = ari_super, y = ws)) +
+  geom_line(aes(x = ari, group = site), color = "black", alpha = 0.5) +
+  geom_line(color = "red") +
+  geom_point(color = "red") +
+  geom_line(
+  data = df_ws_exact,
+  aes(x = ari, y = ws, color = fct_rev(as.factor(p_scale))), lwd = 0.8) +
+  geom_text(
+    data = tibble(
+      ari_super = c(1e4, 1e4),
+      ws = c(23, 23),
+      years = fct_rev(as.factor(paste(c(23, 1000), "years"))),
+      lbl = c("a", "b")
+    ),
+    mapping = aes(label = lbl),
+    size = 10
+  ) +
+  add_axis_x(3e4) +
+  add_axis_y(50) +
+  scale_color_viridis_d() +
+  theme(
+    legend.position = c(0.62, 0.75), legend.title = element_blank(),
+    legend.background = element_blank(),
+    plot.margin = margin(t = 10, r = 10)
+  ) +
+  facet_wrap(~ years, nrow = 1)
+```
+
+```{r}
+#| label: fig-pdf-s3
+#| fig-cap: Probability densities and confidence intervals of $\sigma_3$ for 23 and 1,000 years simulated datasets
+#| fig-subcap: 
+#|   - one-station dataset
+#|   - 25-station grouped dataset
+#| fig-width: 3.5
+#| fig-asp: 1.336
+#| layout-ncol: 2
+#| warning: false
+s3_sim|> 
+  filter(str_starts(stn_type, "one")) |> 
+  ggplot(aes(x = s)) +
+  ggdist::stat_halfeye(aes(thickness = stat(pdf)), .width = c(0.67, 0.95), fill = "grey", slab_color = "blue", slab_linewidth = 0.6, point_color = "red", interval_color = "red") +
+  geom_text(
+    data = tibble(
+      s = c(2.8, 2.8),
+      y = c(0.9, 0.9),
+      yrs = fct_rev(as.factor(paste(c(23, 1000), "years"))),
+      lbl = c("a", "c")
+    ),
+    mapping = aes(y = y, label = lbl),
+    size = 10
+  ) +
+  scale_x_continuous(name = bquote("\U03c3"[3]), limits = c(2.75, 4.25), breaks = seq(3, 4, 0.5), expand = expansion()) +
+  scale_y_continuous(name = "Probability density") +
+  facet_wrap(~ fct_rev(yrs), nrow = 2) +
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+s3_sim|> 
+  filter(str_starts(stn_type, "25")) |> 
+  ggplot(aes(x = s)) +
+  ggdist::stat_halfeye(aes(thickness = stat(pdf)), .width = c(0.67, 0.95), fill = "grey", slab_color = "blue", slab_linewidth = 0.6, point_color = "red", interval_color = "red") +
+  geom_text(
+    data = tibble(
+      s = c(2.8, 2.8),
+      y = c(0.9, 0.9),
+      yrs = fct_rev(as.factor(paste(c(23, 1000), "years"))),
+      lbl = c("b", "d")
+    ),
+    mapping = aes(y = y, label = lbl),
+    size = 10
+  ) +
+  scale_x_continuous(name = bquote("\U03c3"[3]), limits = c(2.75, 4.25), breaks = seq(3, 4, 0.5), expand = expansion()) +
+  # scale_y_continuous(name = "Probability density") +
+  facet_wrap(~ fct_rev(yrs), nrow = 2) +
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+```
+
+```{r}
+#| label: fig-super-homogenise
+#| fig-cap: Simulated superstation data that are from heterogeneous (red line) and 'homogenised' (blue line) environments
+#| warning: false
+
+set.seed(2023081901)
+
+# Generate 23-year wind gusts for all 5 models at all 25 sites
+#   (25 sites * 23 years * 5 exceedances * 5 models = 2875 * 5 rows)
+df_sites <- map2_dfr(s, s_chr,
+  \(scale, scale_chr) get_df_sites(n_sites_demo, rate_exc, n_years, v0, scale, k) |> mutate(p_scale = scale_chr)) |> 
+  nest(.by = c(p_scale, site))
+
+df_models_plot <- tibble(
+  ari_super = rep(get_log_breaks(-1:6, 10), times = length(s)),
+  ws = map(s, \(sgm) map_dbl(ari_super[1:(length(ari_super)/length(s))], \(a) vgpd(a, rate = rate_exc, loc = v0, scale = sgm, shape = k))) |> unlist(),
+  p_scale = rep(unique(df_sites$p_scale), each = length(ari_super)/length(s))
+)
+
+set.seed(2023081901)
+
+# Generate 23-year wind gusts for all 5 models at all 25 sites
+#   (25 sites * 23 years * 5 exceedances * 5 models = 2875 * 5 rows)
+df_5sites_5models <- map2_dfr(s, s_chr,
+  \(scale, scale_chr) get_df_sites(n_sites_demo, rate_exc, n_years_demo, v0, scale, k) |> mutate(p_scale = scale_chr)) |> 
+  nest(.by = c(p_scale, site))
+
+df_ori_plot <- df_5sites_5models |> 
+  unnest(cols = data) |> 
+  arrange(ws)  %>%
+  mutate(ari_super = map_dbl(1:nrow(.), \(j) (n_years_demo * n_sites_demo * length(s) + 1) / (nrow(.) - j + 1))) %>%
+  mutate(taken = rep(c(rep(FALSE, 999), TRUE), nrow(.)/1000)) |> 
+  filter(ari_super > 1e3 | taken)
+
+# Take 5 sites from each of the 5 models
+df_sites_5 <- df_5sites_5models |> 
+  # mean & sd of ws for each site
+  mutate(                                 
+    ws_mean = map_dbl(data, \(d) d$ws |> mean()),
+    ws_sd = map_dbl(data, \(d) d$ws |> sd())) |> 
+  # normalise ws to have mean=0 & sd=1 for each site
+  mutate(data = pmap(list(data, ws_mean, ws_sd), \(data, ws_mean, ws_sd) {
+    data |> 
+      mutate(ws_scaled = (ws - ws_mean) / ws_sd)
+  })) |> 
+  unnest(cols = data) |> 
+  mutate(ws_reg = mean(ws_mean) + mean(ws_sd) * ws_scaled) |> 
+  arrange(ws_reg)  %>%
+  mutate(ari_super = map_dbl(1:nrow(.), \(j) (n_years_demo * n_sites_demo * length(s) + 1) / (nrow(.) - j + 1)))
+
+df_reg_plot <- df_sites_5 %>% 
+  mutate(taken = rep(c(rep(FALSE, 999), TRUE), nrow(.)/1000)) |> 
+  filter(ari_super > 1e3 | taken)
+
+df_reg_plot |> 
+  ggplot(aes(x = ari_super, y = ws_reg)) +
+  geom_line(
+    data = df_models_plot,
+    mapping = aes(y = ws, color = fct_rev(p_scale)),
+    linewidth = 0.8
+  ) +
+  geom_line(color = "blue", alpha = 0.6, linewidth = 1.8) +
+  geom_line(
+    data = df_ori_plot,
+    mapping = aes(y = sort(ws)), color = "red", alpha = 0.6, linewidth = 1.8) +
+  add_axis_x(3e5) +
+  scale_y_continuous(name = "Wind gust speed (m/s)", limits = c(20, 55), expand = expansion()) +
+  scale_color_viridis_d() +
+  theme(legend.position = c(0.15, 0.75), legend.title = element_blank(), legend.background = element_blank())
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
